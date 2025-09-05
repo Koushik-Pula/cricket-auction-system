@@ -26,10 +26,10 @@ import com.mongodb.client.model.Updates;
 
 public class AuctionServer {
     private static final int PORT = 12345;
+    private static final int MAX_CONCURRENT_TEAMS = 10;
     private static final List<Player> players = new ArrayList<>();
     private static final Map<String, ClientHandler> teams = new ConcurrentHashMap<>();
     private static final ExecutorService pool = Executors.newCachedThreadPool();
-    private static final int MAX_TEAMS = 5;
 
     private static volatile Player currentPlayer = null;
     private static volatile String highestBidder = null;
@@ -41,9 +41,9 @@ public class AuctionServer {
         loadPlayers();
 
         ServerSocket serverSocket = new ServerSocket(PORT);
-        System.out.println("[SERVER] Auction server started on port " + PORT);
+        System.out.println("Auction server started on port " + PORT);
+        System.out.println("Maximum concurrent teams allowed: " + MAX_CONCURRENT_TEAMS);
 
-        // Accept clients
         pool.execute(() -> {
             try {
                 while (true) {
@@ -56,7 +56,6 @@ public class AuctionServer {
             }
         });
 
-        // Start auction flow
         runAuction();
     }
 
@@ -74,7 +73,7 @@ public class AuctionServer {
         }
 
         if (players.isEmpty()) {
-            broadcast("[SERVER] No players available yet. Auction will begin once players are added.");
+            broadcast("No players available yet. Auction will begin once players are added.");
         }
     }
 
@@ -87,53 +86,58 @@ public class AuctionServer {
             highestBidder = null;
             highestBid = player.getBasePrice();
 
-            broadcast("\n[AUCTION] Next player: " + player.getName() + " (" + player.getRole() + ") - Base: " + player.getBasePrice());
-            broadcast("[AUCTION] Type 'yes' to participate in this auction.");
+            broadcast("\n--- NEXT PLAYER: " + player.getName() + " (" + player.getRole() + ") ---");
+            broadcast("Base Price: " + player.getBasePrice());
+            broadcast("Type 'yes' to participate");
 
             waitForAllYes(teamsCollection);
 
-            // Skip if no team can afford this player
             boolean anyTeamCanBid = false;
             for (Map.Entry<String, ClientHandler> entry : teams.entrySet()) {
                 Document teamDoc = teamsCollection.find(Filters.eq("teamName", entry.getKey())).first();
-                if (teamDoc.getInteger("budget") >= currentPlayer.getBasePrice()) {
+                if (teamDoc != null && teamDoc.getInteger("budget") >= currentPlayer.getBasePrice()) {
                     anyTeamCanBid = true;
                     break;
                 }
             }
             if (!anyTeamCanBid) {
-                broadcast("[AUCTION] No team can afford " + currentPlayer.getName() + ". Skipping this player.");
+                broadcast("No team can afford " + currentPlayer.getName() + ". Skipping this player.");
                 continue;
             }
 
             auctionActive = true;
-            broadcast("[AUCTION] Bidding started! Base price: " + currentPlayer.getBasePrice());
+            broadcast("BIDDING STARTED! Current bid: " + currentPlayer.getBasePrice());
             startBiddingTimer();
 
             if (highestBidder != null) {
-                broadcast("[RESULT] " + currentPlayer.getName() + " SOLD to " + highestBidder + " for " + highestBid);
+                broadcast("SOLD to " + highestBidder + " for " + highestBid);
 
-                // Update winner's budget in DB
                 Document winnerDoc = teamsCollection.find(Filters.eq("teamName", highestBidder)).first();
-                int newBudget = winnerDoc.getInteger("budget") - highestBid;
-                teamsCollection.updateOne(Filters.eq("teamName", highestBidder), Updates.set("budget", newBudget));
+                if (winnerDoc != null) {
+                    int newBudget = winnerDoc.getInteger("budget") - highestBid;
+                    teamsCollection.updateOne(Filters.eq("teamName", highestBidder), Updates.set("budget", newBudget));
 
-                // Add player to winner's list
-                List<Document> playerList = (List<Document>) winnerDoc.get("players");
-                if (playerList == null) playerList = new ArrayList<>();
-                Document playerDoc = new Document("name", currentPlayer.getName())
-                        .append("role", currentPlayer.getRole())
-                        .append("price", highestBid);
-                playerList.add(playerDoc);
-                teamsCollection.updateOne(Filters.eq("teamName", highestBidder), Updates.set("players", playerList));
+                    List<Document> playerList = (List<Document>) winnerDoc.get("players");
+                    if (playerList == null) playerList = new ArrayList<>();
+                    Document playerDoc = new Document("name", currentPlayer.getName())
+                            .append("role", currentPlayer.getRole())
+                            .append("price", highestBid);
+                    playerList.add(playerDoc);
+                    teamsCollection.updateOne(Filters.eq("teamName", highestBidder), Updates.set("players", playerList));
 
-                // Update player in players collection
-                updatePlayerInDB(currentPlayer, highestBidder, highestBid);
+                    updatePlayerInDB(currentPlayer, highestBidder, highestBid);
+                    
+                    // Notify winning team
+                    if (teams.containsKey(highestBidder)) {
+                        teams.get(highestBidder).send("ACQUIRED: " + currentPlayer.getName() + 
+                            " (" + currentPlayer.getRole() + ") for " + highestBid);
+                    }
+                }
             } else {
-                broadcast("[RESULT] " + currentPlayer.getName() + " remains UNSOLD.");
+                broadcast("UNSOLD - No bids received");
             }
         }
-        broadcast("\n[AUCTION] All players auctioned. Thank you!");
+        broadcast("\nAuction completed. Thank you!");
         System.exit(0);
     }
 
@@ -156,12 +160,13 @@ public class AuctionServer {
                 readyTeams.clear();
                 for (Map.Entry<String, ClientHandler> entry : teams.entrySet()) {
                     Document teamDoc = teamsCollection.find(Filters.eq("teamName", entry.getKey())).first();
-                    int budget = teamDoc.getInteger("budget");
-
-                    if (budget >= currentPlayer.getBasePrice()) {
-                        if (entry.getValue().isReady()) readyTeams.add(entry.getKey());
-                    } else {
-                        entry.getValue().send("[SERVER] You cannot participate for " + currentPlayer.getName() + " (budget too low)");
+                    if (teamDoc != null) {
+                        int budget = teamDoc.getInteger("budget");
+                        if (budget >= currentPlayer.getBasePrice()) {
+                            if (entry.getValue().isReady()) readyTeams.add(entry.getKey());
+                        } else {
+                            entry.getValue().send("Cannot participate for " + currentPlayer.getName() + " (budget too low)");
+                        }
                     }
                 }
             }
@@ -169,14 +174,13 @@ public class AuctionServer {
             try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
         }
 
-        // Reset readiness
         for (ClientHandler handler : teams.values()) {
             handler.setReady(false);
         }
     }
 
     private static void startBiddingTimer() {
-        long endTime = System.currentTimeMillis() + 30000; // 30 sec
+        long endTime = System.currentTimeMillis() + 30000;
         while (System.currentTimeMillis() < endTime) {
             try { Thread.sleep(1000); } catch (InterruptedException ignored) {}
         }
@@ -190,7 +194,6 @@ public class AuctionServer {
         System.out.println(msg);
     }
 
-    // ------------------ ClientHandler ------------------
     private static class ClientHandler implements Runnable {
         private Socket socket;
         private PrintWriter out;
@@ -210,25 +213,25 @@ public class AuctionServer {
                 MongoDatabase db = MongoDBUtil.getDatabase();
                 MongoCollection<Document> teamsCollection = db.getCollection("teams");
 
-                out.println("[SERVER] Enter your team name:");
-                teamName = in.readLine();
-
-                // Limit total number of teams
-                long currentTeams = teamsCollection.countDocuments();
-                if (currentTeams >= MAX_TEAMS) {
-                    out.println("[SERVER] Registration full. Max " + MAX_TEAMS + " teams allowed.");
-                    socket.close();
-                    return;
+                synchronized (teams) {
+                    if (teams.size() >= MAX_CONCURRENT_TEAMS) {
+                        out.println("Auction session full. Maximum " + MAX_CONCURRENT_TEAMS + " teams allowed.");
+                        socket.close();
+                        return;
+                    }
                 }
 
-                // Check if team exists in DB
+                out.println("Enter your team name:");
+                teamName = in.readLine();
+
                 Document existingTeam = teamsCollection.find(Filters.eq("teamName", teamName)).first();
+                
                 if (existingTeam == null) {
-                    out.println("[SERVER] New team! Enter owner's name:");
+                    out.println("New team detected! Enter owner's name:");
                     String owner = in.readLine();
-                    out.println("[SERVER] Enter city:");
+                    out.println("Enter city:");
                     String city = in.readLine();
-                    out.println("[SERVER] Enter budget:");
+                    out.println("Enter budget:");
                     int budget = Integer.parseInt(in.readLine());
 
                     Document teamDoc = new Document("teamName", teamName)
@@ -238,27 +241,33 @@ public class AuctionServer {
                             .append("players", new ArrayList<>());
                     teamsCollection.insertOne(teamDoc);
 
-                    out.println("[SERVER] Registration complete! Welcome " + teamName);
+                    out.println("Registration complete! Welcome, " + teamName);
                 } else {
-                    out.println("[SERVER] Welcome back " + teamName + "!");
+                    out.println("Welcome back, " + teamName + "!");
+                    out.println("Your budget: " + existingTeam.getInteger("budget"));
                 }
 
-                // Add to current session teams map
                 synchronized (teams) {
                     teams.put(teamName, this);
                 }
 
-                out.println("[SERVER] Type 'yes' to join auction, 'bid <amount>' to bid.");
+                out.println("Connected! Auction will begin shortly...");
+                out.println("Commands: 'yes' to participate, 'bid <amount>' to bid");
 
                 String msg;
                 while ((msg = in.readLine()) != null) {
                     handleMessage(msg.trim(), teamsCollection);
                 }
             } catch (IOException e) {
-                e.printStackTrace();
+                System.out.println("Client disconnected: " + (teamName != null ? teamName : "Unknown"));
+            } catch (NumberFormatException e) {
+                out.println("Invalid number format. Please enter valid numbers for budget.");
             } finally {
                 if (teamName != null) {
-                    teams.remove(teamName);
+                    synchronized (teams) {
+                        teams.remove(teamName);
+                    }
+                    System.out.println("Team disconnected: " + teamName);
                 }
                 try { socket.close(); } catch (IOException ignored) {}
             }
@@ -267,35 +276,40 @@ public class AuctionServer {
         private void handleMessage(String msg, MongoCollection<Document> teamsCollection) {
             if (msg.equalsIgnoreCase("yes")) {
                 ready = true;
-                send("[SERVER] You are ready for this auction.");
+                send("Ready for this auction.");
             } else if (msg.startsWith("bid")) {
                 if (!auctionActive || currentPlayer == null) {
-                    send("[SERVER] No active auction right now.");
+                    send("No active auction right now.");
                     return;
                 }
                 try {
                     int bidAmount = Integer.parseInt(msg.split(" ")[1]);
 
                     Document teamDoc = teamsCollection.find(Filters.eq("teamName", teamName)).first();
+                    if (teamDoc == null) {
+                        send("Team data not found. Please reconnect.");
+                        return;
+                    }
+
                     int budget = teamDoc.getInteger("budget");
 
                     if (bidAmount > budget) {
-                        send("[SERVER] Your bid exceeds your remaining budget (" + budget + ")");
+                        send("Bid exceeds your remaining budget (" + budget + ")");
                         return;
                     }
 
                     if (bidAmount > highestBid) {
                         highestBid = bidAmount;
                         highestBidder = teamName;
-                        broadcast("[BID] " + teamName + " bids " + bidAmount + " for " + currentPlayer.getName());
+                        broadcast("BID: " + teamName + " bids " + bidAmount + " for " + currentPlayer.getName());
                     } else {
-                        send("[SERVER] Your bid must be higher than current highest (" + highestBid + ")");
+                        send("Bid must be higher than current highest (" + highestBid + ")");
                     }
                 } catch (Exception e) {
-                    send("[SERVER] Invalid bid format. Use: bid <amount>");
+                    send("Invalid bid format. Use: bid <amount>");
                 }
             } else {
-                send("[SERVER] Unknown command.");
+                send("Unknown command.");
             }
         }
 

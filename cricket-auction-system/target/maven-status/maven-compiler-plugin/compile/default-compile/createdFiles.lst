@@ -1,7 +1,11 @@
 com\auction\model\AuctionManager.class
 com\auction\model\Player.class
 com\auction\server\AuctionServer.class
+com\auction\client\AuctionGUIClient.class
+com\auction\client\AuctionGUIClient$2.class
 com\auction\server\AuctionServer$ClientHandler.class
+com\auction\client\AuctionGUIClient$1.class
 com\auction\db\MongoDBUtil.class
 com\auction\client\AuctionClient.class
 com\auction\model\Team.class
+com\auction\client\AuctionGUIClient$3.class
